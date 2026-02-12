@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from sklearn.metrics import (
     accuracy_score, f1_score, roc_auc_score,
     classification_report,
@@ -58,7 +58,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, amp_dty
         optimizer.zero_grad(set_to_none=True)
 
         if USE_AMP:
-            with autocast(device_type="cuda", dtype=amp_dtype):
+            with autocast("cuda", dtype=amp_dtype):
                 outputs = model(images, clinical)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -98,7 +98,7 @@ def validate(model, loader, criterion, device, amp_dtype):
         clinical = clinical.to(device, non_blocking=True)
 
         if USE_AMP:
-            with autocast(device_type="cuda", dtype=amp_dtype):
+            with autocast("cuda", dtype=amp_dtype):
                 outputs = model(images, clinical)
                 loss = criterion(outputs, labels)
         else:
@@ -298,7 +298,7 @@ def main():
 
             img_optimizer.zero_grad(set_to_none=True)
             if USE_AMP:
-                with autocast(device_type="cuda", dtype=AMP_DTYPE):
+                with autocast("cuda", dtype=AMP_DTYPE):
                     outputs = img_model(images)
                     loss = criterion(outputs, labels)
                 img_scaler.scale(loss).backward()
@@ -320,7 +320,7 @@ def main():
                 images = images.to(DEVICE, non_blocking=True)
                 labels_np = labels.numpy()
                 if USE_AMP:
-                    with autocast(device_type="cuda", dtype=AMP_DTYPE):
+                    with autocast("cuda", dtype=AMP_DTYPE):
                         outputs = img_model(images)
                 else:
                     outputs = img_model(images)
