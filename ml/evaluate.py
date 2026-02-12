@@ -23,7 +23,7 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     roc_auc_score,
 )
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 
 from config import (
     DEVICE, MODEL_DIR, PLOT_DIR, CLASS_NAMES,
@@ -65,7 +65,7 @@ def get_test_predictions(model, test_loader):
             clinical = clinical.to(DEVICE, non_blocking=True)
 
             if USE_AMP:
-                with autocast(device_type="cuda", dtype=AMP_DTYPE):
+                with autocast("cuda", dtype=AMP_DTYPE):
                     outputs = model(images, clinical)
             else:
                 outputs = model(images, clinical)
