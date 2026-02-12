@@ -1,26 +1,32 @@
 """
 Training Script for Brain Stroke Prediction — Hybrid Model
-Production-grade 2-phase fine-tuning with all best practices.
+Production-grade 2-phase fine-tuning.
 
 Strategy:
   Phase 1 (Epochs 1-10):  Freeze backbone → train only heads at LR=1e-3
   Phase 2 (Epochs 11-50): Unfreeze backbone → discriminative LR
                           backbone=1e-5, heads=1e-4 + linear warmup
+                          BatchNorm stays FROZEN to preserve ImageNet stats
 
 Features:
   ✓ 2-phase training (freeze → unfreeze)
   ✓ Discriminative learning rates
   ✓ Linear warmup for Phase 2
+  ✓ Backbone BatchNorm always in eval mode
   ✓ Mixed precision (BF16 on H200, FP16 fallback)
   ✓ Cosine annealing scheduler with warm restarts
   ✓ Class-weighted cross-entropy + label smoothing
   ✓ Gradient clipping (max_norm=1.0)
   ✓ Early stopping by validation AUC-ROC
+  ✓ Reloads best Phase 1 checkpoint before Phase 2
   ✓ Saves best + last model checkpoints
   ✓ Trains image-only model for Grad-CAM
+
+NOTE: torch.compile() is intentionally NOT used.
+      It causes validation divergence on medical imaging fine-tuning
+      tasks due to graph capture issues with frozen/unfrozen BN layers.
 """
 import os
-import sys
 import time
 import random
 import json
@@ -48,7 +54,6 @@ from models import HybridFusionModel, ImageOnlyModel
 
 
 def set_seed(seed: int):
-    """Set random seed for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -58,18 +63,9 @@ def set_seed(seed: int):
         torch.backends.cudnn.benchmark = True
 
 
-def get_warmup_factor(epoch_in_phase2, warmup_epochs):
-    """Linear warmup factor: ramps from 0.1 to 1.0 over warmup_epochs."""
-    if warmup_epochs <= 0:
-        return 1.0
-    if epoch_in_phase2 < warmup_epochs:
-        return 0.1 + 0.9 * (epoch_in_phase2 / warmup_epochs)
-    return 1.0
-
-
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, amp_dtype):
     """Train for one epoch. Returns (avg_loss, accuracy)."""
-    model.train()
+    model.train()  # BN in backbone stays eval via override
     running_loss = 0.0
     all_preds, all_labels = [], []
 
@@ -111,7 +107,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, amp_dty
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, amp_dtype):
-    """Validate the model. Returns (avg_loss, accuracy, f1, auc, all_preds, all_labels, all_probs)."""
+    """Validate. Returns (avg_loss, accuracy, f1, auc, preds, labels, probs)."""
     model.eval()
     running_loss = 0.0
     all_preds, all_labels, all_probs = [], [], []
@@ -142,9 +138,8 @@ def validate(model, loader, criterion, device, amp_dtype):
     f1 = f1_score(all_labels, all_preds, average="macro")
 
     try:
-        all_probs_np = np.array(all_probs)
         auc = roc_auc_score(
-            all_labels, all_probs_np, multi_class="ovr", average="macro"
+            all_labels, np.array(all_probs), multi_class="ovr", average="macro"
         )
     except ValueError:
         auc = 0.0
@@ -152,25 +147,21 @@ def validate(model, loader, criterion, device, amp_dtype):
     return avg_loss, acc, f1, auc, all_preds, all_labels, all_probs
 
 
-def train_image_only_model(train_loader, val_loader, criterion, class_names):
-    """
-    Train a separate image-only model for Grad-CAM explainability.
-    Uses the same 2-phase approach.
-    """
+def train_image_only_model(train_loader, val_loader, criterion):
+    """Train image-only model for Grad-CAM (same 2-phase approach)."""
     print("\n🔬 Training Image-Only model for Grad-CAM...")
 
     img_model = ImageOnlyModel(pretrained=True).to(DEVICE)
 
-    # ── Phase 1: Freeze backbone ──
+    # Phase 1: Freeze backbone
     img_model.freeze_backbone()
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, img_model.parameters()),
-        lr=PHASE1_LR,
-        weight_decay=WEIGHT_DECAY,
+        lr=PHASE1_LR, weight_decay=WEIGHT_DECAY,
     )
     scaler = GradScaler("cuda", enabled=USE_AMP)
 
-    print("  ── Phase 1: Head-only training (5 epochs) ──")
+    print("  ── Phase 1: Head-only (5 epochs) ──")
     for epoch in range(1, 6):
         img_model.train()
         for images, labels, _ in tqdm(train_loader, desc=f"  ImgP1 E{epoch}", leave=False):
@@ -179,28 +170,26 @@ def train_image_only_model(train_loader, val_loader, criterion, class_names):
             optimizer.zero_grad(set_to_none=True)
             if USE_AMP:
                 with autocast("cuda", dtype=AMP_DTYPE):
-                    outputs = img_model(images)
-                    loss = criterion(outputs, labels)
+                    out = img_model(images)
+                    loss = criterion(out, labels)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(img_model.parameters(), max_norm=GRAD_CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = img_model(images)
-                loss = criterion(outputs, labels)
+                out = img_model(images)
+                loss = criterion(out, labels)
                 loss.backward()
                 optimizer.step()
 
-    # ── Phase 2: Unfreeze and fine-tune ──
+    # Phase 2: Unfreeze backbone with discriminative LR
     img_model.unfreeze_backbone()
     optimizer = optim.AdamW(
         img_model.get_param_groups(PHASE2_LR_BACKBONE, PHASE2_LR_HEAD),
         weight_decay=WEIGHT_DECAY,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2,
-    )
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
     scaler = GradScaler("cuda", enabled=USE_AMP)
 
     best_img_auc = 0.0
@@ -214,22 +203,22 @@ def train_image_only_model(train_loader, val_loader, criterion, class_names):
             optimizer.zero_grad(set_to_none=True)
             if USE_AMP:
                 with autocast("cuda", dtype=AMP_DTYPE):
-                    outputs = img_model(images)
-                    loss = criterion(outputs, labels)
+                    out = img_model(images)
+                    loss = criterion(out, labels)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(img_model.parameters(), max_norm=GRAD_CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = img_model(images)
-                loss = criterion(outputs, labels)
+                out = img_model(images)
+                loss = criterion(out, labels)
                 loss.backward()
                 optimizer.step()
 
         scheduler.step()
 
-        # Quick validation
+        # Validation
         img_model.eval()
         img_preds, img_labels, img_probs_list = [], [], []
         with torch.no_grad():
@@ -238,11 +227,11 @@ def train_image_only_model(train_loader, val_loader, criterion, class_names):
                 labels_np = labels.numpy()
                 if USE_AMP:
                     with autocast("cuda", dtype=AMP_DTYPE):
-                        outputs = img_model(images)
+                        out = img_model(images)
                 else:
-                    outputs = img_model(images)
-                probs = torch.softmax(outputs.float(), dim=1).cpu().numpy()
-                img_preds.extend(outputs.argmax(dim=1).cpu().numpy())
+                    out = img_model(images)
+                probs = torch.softmax(out.float(), dim=1).cpu().numpy()
+                img_preds.extend(out.argmax(dim=1).cpu().numpy())
                 img_labels.extend(labels_np)
                 img_probs_list.extend(probs)
 
@@ -250,7 +239,6 @@ def train_image_only_model(train_loader, val_loader, criterion, class_names):
             img_auc = roc_auc_score(img_labels, np.array(img_probs_list), multi_class="ovr", average="macro")
         except ValueError:
             img_auc = 0.0
-
         img_acc = accuracy_score(img_labels, img_preds)
 
         if epoch % 5 == 0 or epoch == 1:
@@ -275,8 +263,9 @@ def main():
         print(f"   VRAM:            {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"   Mixed Precision: {USE_AMP} ({AMP_DTYPE})")
     print(f"   Phase 1:         {PHASE1_EPOCHS} epochs (frozen backbone, LR={PHASE1_LR})")
-    print(f"   Phase 2:         {PHASE2_EPOCHS} epochs (unfrozen, backbone LR={PHASE2_LR_BACKBONE}, head LR={PHASE2_LR_HEAD})")
+    print(f"   Phase 2:         {PHASE2_EPOCHS} epochs (unfrozen, bb LR={PHASE2_LR_BACKBONE}, head LR={PHASE2_LR_HEAD})")
     print(f"   Warmup:          {WARMUP_EPOCHS} epochs (linear)")
+    print(f"   Backbone BN:     Always frozen (eval mode)")
     print()
 
     # ── Data ──────────────────────────────────────────────────────────
@@ -306,8 +295,8 @@ def main():
         "val_loss": [], "val_acc": [], "val_f1": [], "val_auc": [],
         "phase": [], "lr_backbone": [], "lr_head": [],
     }
-
     global_epoch = 0
+    best_model_path = os.path.join(MODEL_DIR, "hybrid_model_best.pth")
 
     # ═══════════════════════════════════════════════════════════════════
     #   PHASE 1: Freeze backbone — Train only heads
@@ -318,11 +307,9 @@ def main():
 
     model.freeze_backbone()
 
-    # Only optimize parameters that require grad (heads only)
     optimizer_p1 = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=PHASE1_LR,
-        weight_decay=WEIGHT_DECAY,
+        lr=PHASE1_LR, weight_decay=WEIGHT_DECAY,
     )
     scheduler_p1 = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer_p1, T_0=5, T_mult=1,
@@ -330,12 +317,11 @@ def main():
 
     trainable_p1 = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Trainable params: {trainable_p1:,} (heads only)")
-    print(f"   Learning rate:    {PHASE1_LR}")
-    print()
+    print(f"   Learning rate:    {PHASE1_LR}\n")
 
     for epoch in range(1, PHASE1_EPOCHS + 1):
         global_epoch += 1
-        epoch_start = time.time()
+        t0 = time.time()
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer_p1, scaler, DEVICE, AMP_DTYPE
@@ -346,9 +332,8 @@ def main():
         scheduler_p1.step()
 
         lr = optimizer_p1.param_groups[0]["lr"]
-        elapsed = time.time() - epoch_start
+        elapsed = time.time() - t0
 
-        # Record
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
@@ -361,17 +346,16 @@ def main():
 
         print(
             f"[P1] Epoch {global_epoch:3d}/{TOTAL_EPOCHS} | "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  "
-            f"F1: {val_f1:.4f}  AUC: {val_auc:.4f} | "
+            f"Train: {train_loss:.4f} / {train_acc:.4f} | "
+            f"Val: {val_loss:.4f} / {val_acc:.4f}  F1: {val_f1:.4f}  AUC: {val_auc:.4f} | "
             f"LR: {lr:.2e} | {elapsed:.1f}s"
         )
 
         if val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "hybrid_model_best.pth"))
-            print(f"  💾 Saved best model (AUC: {best_auc:.4f})")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  💾 Best model (AUC: {best_auc:.4f})")
         else:
             patience_counter += 1
 
@@ -379,12 +363,16 @@ def main():
     #   PHASE 2: Unfreeze backbone — Full fine-tuning
     # ═══════════════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
-    print("🔓 PHASE 2: Backbone UNFROZEN — Full fine-tuning")
+    print("🔓 PHASE 2: Backbone UNFROZEN — Full fine-tuning (BN frozen)")
     print("=" * 60)
+
+    # Reload best Phase 1 model before Phase 2
+    print("   📂 Loading best Phase 1 checkpoint...")
+    model.load_state_dict(torch.load(best_model_path, weights_only=True))
 
     model.unfreeze_backbone()
 
-    # Discriminative LR: backbone gets 10x lower LR
+    # Discriminative LR
     param_groups = model.get_param_groups(PHASE2_LR_BACKBONE, PHASE2_LR_HEAD)
     optimizer_p2 = optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
 
@@ -392,35 +380,24 @@ def main():
         optimizer_p2, T_0=SCHEDULER_T0, T_mult=SCHEDULER_TMULT,
     )
 
-    # Reset scaler for new optimizer
     scaler = GradScaler("cuda", enabled=USE_AMP)
-
-    # Compile model for Phase 2 (better to compile after unfreezing)
-    try:
-        model = torch.compile(model)
-        print("   ✅ torch.compile() enabled for Phase 2")
-    except Exception:
-        print("   ⚠️  torch.compile() not available")
+    patience_counter = 0  # Reset for Phase 2
 
     print(f"   Backbone LR:   {PHASE2_LR_BACKBONE}")
     print(f"   Head LR:       {PHASE2_LR_HEAD}")
     print(f"   Warmup:        {WARMUP_EPOCHS} epochs")
-    print()
-
-    patience_counter = 0  # Reset patience for Phase 2
+    print(f"   Backbone BN:   eval mode (stats preserved)\n")
 
     for epoch in range(1, PHASE2_EPOCHS + 1):
         global_epoch += 1
-        epoch_start = time.time()
+        t0 = time.time()
 
-        # Linear warmup
-        warmup_factor = get_warmup_factor(epoch - 1, WARMUP_EPOCHS)
+        # Linear warmup for first few epochs
         if epoch <= WARMUP_EPOCHS:
+            warmup_factor = 0.1 + 0.9 * (epoch / WARMUP_EPOCHS)
             for pg in optimizer_p2.param_groups:
-                if pg["name"] == "backbone":
-                    pg["lr"] = PHASE2_LR_BACKBONE * warmup_factor
-                else:
-                    pg["lr"] = PHASE2_LR_HEAD * warmup_factor
+                base_lr = PHASE2_LR_BACKBONE if pg["name"] == "backbone" else PHASE2_LR_HEAD
+                pg["lr"] = base_lr * warmup_factor
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer_p2, scaler, DEVICE, AMP_DTYPE
@@ -434,9 +411,8 @@ def main():
 
         lr_bb = optimizer_p2.param_groups[0]["lr"]
         lr_hd = optimizer_p2.param_groups[1]["lr"]
-        elapsed = time.time() - epoch_start
+        elapsed = time.time() - t0
 
-        # Record
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
@@ -449,17 +425,16 @@ def main():
 
         print(
             f"[P2] Epoch {global_epoch:3d}/{TOTAL_EPOCHS} | "
-            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  "
-            f"F1: {val_f1:.4f}  AUC: {val_auc:.4f} | "
-            f"LR(bb): {lr_bb:.2e} LR(hd): {lr_hd:.2e} | {elapsed:.1f}s"
+            f"Train: {train_loss:.4f} / {train_acc:.4f} | "
+            f"Val: {val_loss:.4f} / {val_acc:.4f}  F1: {val_f1:.4f}  AUC: {val_auc:.4f} | "
+            f"bb: {lr_bb:.2e} hd: {lr_hd:.2e} | {elapsed:.1f}s"
         )
 
         if val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0
-            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "hybrid_model_best.pth"))
-            print(f"  💾 Saved best model (AUC: {best_auc:.4f})")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  💾 Best model (AUC: {best_auc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= EARLY_STOP_PATIENCE:
@@ -468,7 +443,6 @@ def main():
 
     # ── Save Last Model & History ─────────────────────────────────────
     torch.save(model.state_dict(), os.path.join(MODEL_DIR, "hybrid_model_last.pth"))
-
     with open(os.path.join(MODEL_DIR, "training_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
@@ -479,13 +453,7 @@ def main():
     print("📊 Final Test Set Evaluation")
     print("=" * 60)
 
-    # Load best model
-    best_state = torch.load(os.path.join(MODEL_DIR, "hybrid_model_best.pth"), weights_only=True)
-    # Handle torch.compile() wrapper
-    if hasattr(model, '_orig_mod'):
-        model._orig_mod.load_state_dict(best_state)
-    else:
-        model.load_state_dict(best_state)
+    model.load_state_dict(torch.load(best_model_path, weights_only=True))
 
     test_loss, test_acc, test_f1, test_auc, test_preds, test_labels, test_probs = validate(
         model, test_loader, criterion, DEVICE, AMP_DTYPE
@@ -498,7 +466,6 @@ def main():
     final_class_names = class_names if class_names else CLASS_NAMES
     print(f"\n{classification_report(test_labels, test_preds, target_names=final_class_names)}")
 
-    # Save test results
     test_results = {
         "accuracy": float(test_acc),
         "f1_macro": float(test_f1),
@@ -513,7 +480,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════
     #   TRAIN IMAGE-ONLY MODEL (for Grad-CAM)
     # ═══════════════════════════════════════════════════════════════════
-    img_auc = train_image_only_model(train_loader, val_loader, criterion, final_class_names)
+    img_auc = train_image_only_model(train_loader, val_loader, criterion)
 
     # ── Final Summary ─────────────────────────────────────────────────
     print("\n" + "=" * 60)

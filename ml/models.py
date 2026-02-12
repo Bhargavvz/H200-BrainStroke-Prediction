@@ -7,8 +7,13 @@ Model Architectures for Brain Stroke Prediction
 
 Freeze/Unfreeze API:
   model.freeze_backbone()   — Phase 1: train only heads
-  model.unfreeze_backbone() — Phase 2: fine-tune everything
+  model.unfreeze_backbone() — Phase 2: fine-tune everything (BN stays frozen)
   model.get_param_groups()  — Returns discriminative LR groups
+
+IMPORTANT: Backbone BatchNorm layers are ALWAYS kept in eval mode
+to preserve ImageNet running statistics. This prevents the val loss
+explosion that occurs when BN switches to batch statistics on a
+small/different-domain dataset.
 """
 import torch
 import torch.nn as nn
@@ -21,15 +26,25 @@ from config import (
 )
 
 
+def _freeze_bn(module):
+    """Recursively set all BatchNorm layers to eval mode."""
+    for m in module.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
+            m.eval()
+            # Prevent running stats from updating
+            m.track_running_stats = False
+
+
+def _unfreeze_bn(module):
+    """Restore BatchNorm tracking (only for head BN, not backbone)."""
+    for m in module.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
+            m.track_running_stats = True
+
+
 class StrokeImageModel(nn.Module):
     """
     EfficientNet-B4 backbone for MRI image feature extraction.
-
-    Why EfficientNet-B4:
-      - Best accuracy-to-parameter ratio via compound scaling
-      - Captures multi-scale features critical for stroke lesion detection
-      - Pretrained on ImageNet — excellent transfer to medical images
-      - Moderate size (19M params) — trains fast even on smaller datasets
 
     Input:  (B, 3, 380, 380) image tensor
     Output: (B, IMAGE_FEATURE_DIM) feature vector
@@ -38,16 +53,14 @@ class StrokeImageModel(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
 
-        # Load EfficientNet-B4 backbone
         self.backbone = timm.create_model(
             "efficientnet_b4",
             pretrained=pretrained,
-            num_classes=0,           # Remove classifier → gives pooled features
+            num_classes=0,
             global_pool="avg",
         )
-        backbone_out = self.backbone.num_features  # 1792 for EfficientNet-B4
+        backbone_out = self.backbone.num_features  # 1792
 
-        # Feature projection head
         self.feature_head = nn.Sequential(
             nn.Dropout(DROPOUT_RATE),
             nn.Linear(backbone_out, 512),
@@ -59,32 +72,45 @@ class StrokeImageModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+        self._backbone_frozen = False
+
     def forward(self, x):
-        features = self.backbone(x)             # (B, 1792)
-        features = self.feature_head(features)  # (B, 256)
+        features = self.backbone(x)
+        features = self.feature_head(features)
         return features
+
+    def train(self, mode=True):
+        """
+        Override train() to ALWAYS keep backbone BN in eval mode.
+        This preserves ImageNet running statistics during fine-tuning.
+        """
+        super().train(mode)
+        if mode and self._backbone_frozen:
+            # When backbone is frozen, keep entire backbone in eval
+            self.backbone.eval()
+        elif mode:
+            # When backbone is unfrozen, keep ONLY BN in eval
+            _freeze_bn(self.backbone)
+        return self
 
     def freeze_backbone(self):
         """Freeze all backbone parameters (Phase 1)."""
+        self._backbone_frozen = True
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # Keep BatchNorm in eval mode when frozen
-        for module in self.backbone.modules():
-            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                module.eval()
+        self.backbone.eval()
 
     def unfreeze_backbone(self):
-        """Unfreeze all backbone parameters (Phase 2)."""
+        """Unfreeze backbone params but keep BN frozen (Phase 2)."""
+        self._backbone_frozen = False
         for param in self.backbone.parameters():
             param.requires_grad = True
+        # BN stays in eval via the train() override above
 
 
 class ClinicalDNN(nn.Module):
     """
     4-layer MLP for clinical / tabular features.
-
-    Input features: age, gender, hypertension, heart_disease,
-                    avg_glucose_level, bmi, smoking_status, cholesterol
     Input:  (B, NUM_CLINICAL_FEATURES) tensor
     Output: (B, CLINICAL_FEATURE_DIM) feature vector
     """
@@ -108,20 +134,12 @@ class ClinicalDNN(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)  # (B, 16)
+        return self.net(x)
 
 
 class HybridFusionModel(nn.Module):
     """
-    Late Fusion: concatenate image features + clinical features,
-    then pass through a fusion classification head.
-
-    Fusion Strategy — Late Fusion:
-      - Image and clinical data have fundamentally different feature spaces
-      - Late fusion allows each branch to learn domain-specific representations
-        before combining them
-      - Concatenation preserves all information from both branches
-      - Fusion head learns optimal weighting automatically
+    Late Fusion: image features + clinical features → classification.
 
     Input:  (image: (B,3,380,380), clinical: (B,8))
     Output: (B, NUM_CLASSES) logits
@@ -132,7 +150,7 @@ class HybridFusionModel(nn.Module):
         self.image_model = StrokeImageModel(pretrained=pretrained)
         self.clinical_model = ClinicalDNN()
 
-        fusion_in = IMAGE_FEATURE_DIM + CLINICAL_FEATURE_DIM  # 256 + 16 = 272
+        fusion_in = IMAGE_FEATURE_DIM + CLINICAL_FEATURE_DIM
 
         self.fusion_head = nn.Sequential(
             nn.Linear(fusion_in, FUSION_HIDDEN_DIM),
@@ -143,35 +161,29 @@ class HybridFusionModel(nn.Module):
         )
 
     def forward(self, image, clinical):
-        img_feat = self.image_model(image)         # (B, 256)
-        cli_feat = self.clinical_model(clinical)   # (B, 16)
-        fused = torch.cat([img_feat, cli_feat], dim=1)  # (B, 272)
-        logits = self.fusion_head(fused)           # (B, 3)
+        img_feat = self.image_model(image)
+        cli_feat = self.clinical_model(clinical)
+        fused = torch.cat([img_feat, cli_feat], dim=1)
+        logits = self.fusion_head(fused)
         return logits
 
     def get_image_features(self, image):
-        """Extract image features only (for Grad-CAM)."""
         return self.image_model(image)
 
     def freeze_backbone(self):
-        """Freeze EfficientNet backbone (Phase 1)."""
         self.image_model.freeze_backbone()
         frozen = sum(1 for p in self.parameters() if not p.requires_grad)
         total = sum(1 for p in self.parameters())
         print(f"   🔒 Backbone frozen: {frozen}/{total} parameter groups frozen")
 
     def unfreeze_backbone(self):
-        """Unfreeze EfficientNet backbone (Phase 2)."""
         self.image_model.unfreeze_backbone()
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"   🔓 Backbone unfrozen: {trainable:,} trainable params")
+        print(f"   🔓 Backbone unfrozen: {trainable:,} trainable params (BN stays frozen)")
 
     def get_param_groups(self, lr_backbone, lr_head):
-        """
-        Return parameter groups with discriminative learning rates.
-        Backbone gets a much lower LR to preserve pretrained features.
-        """
-        backbone_params = list(self.image_model.backbone.parameters())
+        """Discriminative LR: backbone gets lower LR to preserve pretrained features."""
+        backbone_params = [p for p in self.image_model.backbone.parameters() if p.requires_grad]
         head_params = (
             list(self.image_model.feature_head.parameters()) +
             list(self.clinical_model.parameters()) +
@@ -184,10 +196,7 @@ class HybridFusionModel(nn.Module):
 
 
 class ImageOnlyModel(nn.Module):
-    """
-    Standalone image classifier for Grad-CAM and image-only inference.
-    Wraps StrokeImageModel with a classification head.
-    """
+    """Standalone image classifier for Grad-CAM and image-only inference."""
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
@@ -212,7 +221,7 @@ class ImageOnlyModel(nn.Module):
         self.image_model.unfreeze_backbone()
 
     def get_param_groups(self, lr_backbone, lr_head):
-        backbone_params = list(self.image_model.backbone.parameters())
+        backbone_params = [p for p in self.image_model.backbone.parameters() if p.requires_grad]
         head_params = (
             list(self.image_model.feature_head.parameters()) +
             list(self.classifier.parameters())
