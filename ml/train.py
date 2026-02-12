@@ -136,7 +136,7 @@ def main():
     print(f"   Device:          {DEVICE}")
     if torch.cuda.is_available():
         print(f"   GPU:             {torch.cuda.get_device_name(0)}")
-        print(f"   VRAM:            {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"   VRAM:            {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"   Mixed Precision: {USE_AMP} ({AMP_DTYPE})")
     print(f"   Epochs:          {EPOCHS}")
     print(f"   Learning Rate:   {LEARNING_RATE}")
