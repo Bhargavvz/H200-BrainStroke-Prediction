@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════
+# Brain Stroke Prediction — .gitignore
+# NOTE: Trained models (.pth, .pt) are tracked via Git LFS!
+# ═══════════════════════════════════════════════════════════
+
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+
+# ── Virtual Environments ──────────────────────────────────
+venv/
+env/
+.venv/
+.env
+
+# ── IDE / Editor ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ───────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Dataset (large, download via script) ──────────────────
+ml/data/
+*.zip
+*.tar.gz
+
+# ── ML Training Artifacts (non-model) ─────────────────────
+ml/plots/
+ml/logs/
+ml/runs/
+wandb/
+
+# ── Node / Frontend ──────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── OS Files ─────────────────────────────────────────────
+.DS_Store
+Desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# ═══════════════════════════════════════════════════════════
+# IMPORTANT: The following are NOT ignored (tracked via LFS):
+#   - ml/models/*.pth    (trained PyTorch models)
+#   - ml/models/*.pt     (traced/scripted models)
+# ═══════════════════════════════════════════════════════════
