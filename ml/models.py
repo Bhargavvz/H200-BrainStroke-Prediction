@@ -3,6 +3,12 @@ Model Architectures for Brain Stroke Prediction
   1. StrokeImageModel  — EfficientNet-B4 backbone (pretrained on ImageNet)
   2. ClinicalDNN       — 4-layer MLP for clinical/tabular features
   3. HybridFusionModel — Late fusion of image + clinical features
+  4. ImageOnlyModel    — For standalone inference & Grad-CAM
+
+Freeze/Unfreeze API:
+  model.freeze_backbone()   — Phase 1: train only heads
+  model.unfreeze_backbone() — Phase 2: fine-tune everything
+  model.get_param_groups()  — Returns discriminative LR groups
 """
 import torch
 import torch.nn as nn
@@ -57,6 +63,20 @@ class StrokeImageModel(nn.Module):
         features = self.backbone(x)             # (B, 1792)
         features = self.feature_head(features)  # (B, 256)
         return features
+
+    def freeze_backbone(self):
+        """Freeze all backbone parameters (Phase 1)."""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        # Keep BatchNorm in eval mode when frozen
+        for module in self.backbone.modules():
+            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                module.eval()
+
+    def unfreeze_backbone(self):
+        """Unfreeze all backbone parameters (Phase 2)."""
+        for param in self.backbone.parameters():
+            param.requires_grad = True
 
 
 class ClinicalDNN(nn.Module):
@@ -133,6 +153,35 @@ class HybridFusionModel(nn.Module):
         """Extract image features only (for Grad-CAM)."""
         return self.image_model(image)
 
+    def freeze_backbone(self):
+        """Freeze EfficientNet backbone (Phase 1)."""
+        self.image_model.freeze_backbone()
+        frozen = sum(1 for p in self.parameters() if not p.requires_grad)
+        total = sum(1 for p in self.parameters())
+        print(f"   🔒 Backbone frozen: {frozen}/{total} parameter groups frozen")
+
+    def unfreeze_backbone(self):
+        """Unfreeze EfficientNet backbone (Phase 2)."""
+        self.image_model.unfreeze_backbone()
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"   🔓 Backbone unfrozen: {trainable:,} trainable params")
+
+    def get_param_groups(self, lr_backbone, lr_head):
+        """
+        Return parameter groups with discriminative learning rates.
+        Backbone gets a much lower LR to preserve pretrained features.
+        """
+        backbone_params = list(self.image_model.backbone.parameters())
+        head_params = (
+            list(self.image_model.feature_head.parameters()) +
+            list(self.clinical_model.parameters()) +
+            list(self.fusion_head.parameters())
+        )
+        return [
+            {"params": backbone_params, "lr": lr_backbone, "name": "backbone"},
+            {"params": head_params, "lr": lr_head, "name": "head"},
+        ]
+
 
 class ImageOnlyModel(nn.Module):
     """
@@ -155,3 +204,20 @@ class ImageOnlyModel(nn.Module):
     @property
     def backbone(self):
         return self.image_model.backbone
+
+    def freeze_backbone(self):
+        self.image_model.freeze_backbone()
+
+    def unfreeze_backbone(self):
+        self.image_model.unfreeze_backbone()
+
+    def get_param_groups(self, lr_backbone, lr_head):
+        backbone_params = list(self.image_model.backbone.parameters())
+        head_params = (
+            list(self.image_model.feature_head.parameters()) +
+            list(self.classifier.parameters())
+        )
+        return [
+            {"params": backbone_params, "lr": lr_backbone, "name": "backbone"},
+            {"params": head_params, "lr": lr_head, "name": "head"},
+        ]

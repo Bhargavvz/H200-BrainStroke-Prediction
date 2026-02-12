@@ -1,6 +1,10 @@
 """
 Brain Stroke Prediction System — Configuration
 All hyperparameters, paths, and training settings.
+
+Training Strategy (2-Phase Fine-Tuning):
+  Phase 1 — Freeze backbone, train only classification heads
+  Phase 2 — Unfreeze backbone with discriminative LR (10x lower for backbone)
 """
 import os
 import torch
@@ -27,15 +31,25 @@ IMG_CHANNELS = 3                 # Convert grayscale → 3-channel for pretraine
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-# ─── Training ──────────────────────────────────────────────────────────────────
-BATCH_SIZE = 64                  # Adjust based on available VRAM
+# ─── Training — Phase 1 (Frozen Backbone) ─────────────────────────────────────
+BATCH_SIZE = 64                  # Large batch for H200 GPU
 NUM_WORKERS = 4
 PIN_MEMORY = True
-EPOCHS = 50
-EARLY_STOP_PATIENCE = 10
-LEARNING_RATE = 1e-4
+PHASE1_EPOCHS = 10               # Train head only
+PHASE1_LR = 1e-3                 # Higher LR when backbone is frozen
+
+# ─── Training — Phase 2 (Full Fine-Tuning) ────────────────────────────────────
+PHASE2_EPOCHS = 40               # Full fine-tuning
+PHASE2_LR_BACKBONE = 1e-5        # Very low LR for pretrained backbone (10x lower)
+PHASE2_LR_HEAD = 1e-4            # Regular LR for classification head
+WARMUP_EPOCHS = 3                # Linear LR warmup at start of Phase 2
+
+# ─── General Training ─────────────────────────────────────────────────────────
+TOTAL_EPOCHS = PHASE1_EPOCHS + PHASE2_EPOCHS   # 50 total
+EARLY_STOP_PATIENCE = 12
 WEIGHT_DECAY = 1e-4
 LABEL_SMOOTHING = 0.1
+GRAD_CLIP_NORM = 1.0
 
 # ─── Mixed Precision ──────────────────────────────────────────────────────────
 USE_AMP = True
