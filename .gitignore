@@ -39,8 +39,6 @@ ml/data/
 *.tar.gz
 
 # ── ML Training Artifacts (non-model) ─────────────────────
-ml/plots/
-ml/logs/
 ml/runs/
 wandb/
 
