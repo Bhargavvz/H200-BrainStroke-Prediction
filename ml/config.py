@@ -15,7 +15,7 @@ for d in [DATA_DIR, MODEL_DIR, PLOT_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ─── Dataset ───────────────────────────────────────────────────────────────────
-CLASS_NAMES = ["No stroke", "Ischemia", "Bleeding"]
+CLASS_NAMES = ["Normal", "Ischemia", "Bleeding"]
 NUM_CLASSES = len(CLASS_NAMES)
 TRAIN_SPLIT = 0.70
 VAL_SPLIT = 0.15

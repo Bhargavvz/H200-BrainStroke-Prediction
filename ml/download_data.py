@@ -5,7 +5,7 @@ it into train/val/test splits with stratified sampling.
 
 Dataset: Brain Stroke CT Dataset (ozguraslank/brain-stroke-ct-dataset)
   - 6,653 CT brain slice images (annotated by 7 radiologists)
-  - 3 classes: No Stroke (4,428), Ischemia (1,131), Bleeding (1,094)
+  - 3 classes: Normal (4,428), Ischemia (1,131), Bleeding (1,094)
   - Source: Turkish Ministry of Health (TEKNOFEST-2021)
   - Citation: Koç U, et al. Eurasian J Med., 2022;54(3):248-258
 """
@@ -18,6 +18,12 @@ from collections import Counter
 from config import DATA_DIR, TRAIN_SPLIT, VAL_SPLIT, SEED, CLASS_NAMES
 
 random.seed(SEED)
+
+# Folders to SKIP (not actual training classes)
+SKIP_DIRS = {"external_test", ".ds_store", "__macosx", ".ipynb_checkpoints"}
+
+# Supported image extensions
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
 def download_dataset():
@@ -33,10 +39,10 @@ def download_dataset():
     except Exception as e:
         print(f"⚠️  kagglehub download failed: {e}")
         print("Trying alternative: looking for dataset in data/ directory...")
-        # Check if dataset already exists
         possible_paths = [
             DATA_DIR,
-            os.path.join(DATA_DIR, "brain-stroke-ct-image-dataset"),
+            os.path.join(DATA_DIR, "Brain_Stroke_CT_Dataset"),
+            os.path.join(DATA_DIR, "brain-stroke-ct-dataset"),
         ]
         for p in possible_paths:
             if os.path.exists(p) and any(os.scandir(p)):
@@ -56,37 +62,39 @@ def find_image_root(download_path: str) -> str:
     """
     download_path = str(download_path)
 
-    # Look for directories that match our class names or common patterns
     for root, dirs, files in os.walk(download_path):
-        # Check if this directory contains subdirectories that look like class folders
-        lower_dirs = [d.lower() for d in dirs]
+        # Filter out hidden/skip directories
+        class_dirs = [d for d in dirs if d.lower() not in SKIP_DIRS and not d.startswith(".")]
+        lower_dirs = [d.lower() for d in class_dirs]
+
         has_normal = any("normal" in d or "no stroke" in d or "no_stroke" in d for d in lower_dirs)
         has_stroke = any("stroke" in d or "hemorrh" in d or "ischem" in d or "bleed" in d for d in lower_dirs)
 
         if has_normal and has_stroke:
             print(f"📂 Found image root: {root}")
-            print(f"   Classes found: {dirs}")
+            print(f"   All directories: {dirs}")
+            print(f"   Class directories: {class_dirs}")
             return root
 
-    # If no class dirs found, maybe images are directly in the download path
-    # Check for a single subfolder that contains class folders
-    for item in Path(download_path).rglob("*"):
-        if item.is_dir():
-            subdirs = [d.name for d in item.iterdir() if d.is_dir()]
-            lower_subdirs = [s.lower() for s in subdirs]
-            has_n = any("normal" in s or "no stroke" in s or "no_stroke" in s for s in lower_subdirs)
-            has_s = any("stroke" in s or "hemorrh" in s or "ischem" in s or "bleed" in s for s in lower_subdirs)
-            if has_n and has_s:
-                print(f"📂 Found image root: {item}")
-                print(f"   Classes found: {subdirs}")
-                return str(item)
-
     raise RuntimeError(f"Could not find class directories in: {download_path}")
+
+
+def collect_images_recursive(directory: Path):
+    """
+    Recursively collect all image files from a directory and all
+    its subdirectories. This handles datasets where images are nested.
+    """
+    images = []
+    for f in directory.rglob("*"):
+        if f.is_file() and f.suffix.lower() in IMG_EXTS:
+            images.append(f)
+    return images
 
 
 def organize_dataset(image_root: str):
     """
     Organize images into train/val/test splits with stratified sampling.
+    Handles nested directory structures by recursively finding all images.
     """
     output_dirs = {
         split: os.path.join(DATA_DIR, split)
@@ -98,22 +106,31 @@ def organize_dataset(image_root: str):
         if os.path.exists(split_dir):
             shutil.rmtree(split_dir)
 
-    # Collect all images per class
+    # Collect all images per class (recursive search!)
     class_images = {}
-    class_dirs = [d for d in Path(image_root).iterdir() if d.is_dir()]
+    all_dirs = [d for d in Path(image_root).iterdir() if d.is_dir()]
 
-    for class_dir in sorted(class_dirs):
+    for class_dir in sorted(all_dirs):
         class_name = class_dir.name
-        images = [
-            f for f in class_dir.iterdir()
-            if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-        ]
+
+        # Skip non-class directories
+        if class_name.lower() in SKIP_DIRS or class_name.startswith("."):
+            print(f"  ⏭️  Skipping: {class_name}")
+            continue
+
+        # Recursively find ALL images in this class directory
+        images = collect_images_recursive(class_dir)
+
         if images:
             class_images[class_name] = images
             print(f"  📁 {class_name}: {len(images)} images")
+        else:
+            print(f"  ⚠️  {class_name}: 0 images (skipping)")
 
     if not class_images:
         raise RuntimeError(f"No images found in {image_root}")
+
+    print(f"\n  Total: {sum(len(v) for v in class_images.values())} images across {len(class_images)} classes")
 
     # Stratified split
     total = 0
@@ -122,7 +139,6 @@ def organize_dataset(image_root: str):
         n = len(images)
         n_train = int(n * TRAIN_SPLIT)
         n_val = int(n * VAL_SPLIT)
-        # rest goes to test
 
         splits = {
             "train": images[:n_train],
@@ -143,7 +159,7 @@ def organize_dataset(image_root: str):
     for split_name in ["train", "val", "test"]:
         split_dir = output_dirs[split_name]
         counts = {}
-        for class_dir in Path(split_dir).iterdir():
+        for class_dir in sorted(Path(split_dir).iterdir()):
             if class_dir.is_dir():
                 count = len(list(class_dir.iterdir()))
                 counts[class_dir.name] = count
@@ -153,7 +169,7 @@ def organize_dataset(image_root: str):
 
 
 def main():
-    print("🧠 Brain Stroke MRI Dataset Setup")
+    print("🧠 Brain Stroke CT Dataset Setup")
     print("=" * 50)
 
     # Step 1: Download
