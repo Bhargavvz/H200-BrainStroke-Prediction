@@ -1,0 +1,12 @@
+{
+  "accuracy": 0.9357870007830854,
+  "f1_macro": 0.9348186146477152,
+  "auc_roc": 0.9940868218819817,
+  "best_val_auc": 0.98759114299328,
+  "class_names": [
+    "Bleeding",
+    "Ischemia",
+    "Normal"
+  ],
+  "total_epochs_trained": 50
+}
